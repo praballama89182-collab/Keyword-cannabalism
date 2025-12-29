@@ -3,192 +3,202 @@ import pandas as pd
 import io
 
 # Set Page Config
-st.set_page_config(page_title="Amazon Search Term Cannibalization Tool", layout="wide")
+st.set_page_config(page_title="Amazon Search Term Optimizer", layout="wide")
 
-st.title("🔍 Amazon Search Term Cannibalization & Negation Analyzer")
+st.title("🔍 Amazon Search Term Optimizer: Cannibalization & Harvesting")
 st.markdown("""
-Upload your **Sponsored Products Search Term Report** (CSV or Excel).
-**Logic Used:**
-1. Identifies search terms appearing in multiple ad groups.
-2. Compares **Sales Volume** vs. **ROAS**.
-3. **Winner Rule:** It keeps the Highest Sales target UNLESS the alternative has a **ROAS > 30% better**, in which case it prioritizes Efficiency.
+This tool performs two major analyses on your Search Term Report:
+1.  **Cannibalization:** Finds terms appearing in multiple ad groups and suggests where to Keep vs. Negate.
+2.  **Harvesting (New!):** Finds high-converting terms (Orders ≥ 2) in **Auto/Broad/Phrase** campaigns that are **NOT** yet targeted as Exact keywords.
 """)
 
-# --- DECISION LOGIC FUNCTION ---
+# --- HELPER FUNCTIONS ---
+
 def determine_winner(group):
     """
     Decides which row to KEEP based on Sales vs ROAS trade-off.
-    Returns the index of the winner.
     """
-    # 1. Find the row with Max Sales
     max_sales_idx = group['sales_val'].idxmax()
     max_sales_row = group.loc[max_sales_idx]
     
-    # 2. Find the row with Max ROAS
     max_roas_idx = group['calculated_roas'].idxmax()
     max_roas_row = group.loc[max_roas_idx]
     
-    # 3. Compare
-    # If the same row has both max sales and max roas, it's the winner.
     if max_sales_idx == max_roas_idx:
         return max_sales_idx, "Best Sales & ROAS"
     
-    # If different, apply the 30% threshold rule
-    # Get the ROAS of the 'Sales Winner' to compare against the 'ROAS Winner'
     roas_of_sales_winner = max_sales_row['calculated_roas']
     roas_of_roas_winner = max_roas_row['calculated_roas']
     
-    # Avoid division by zero issues
     if roas_of_sales_winner == 0:
         return max_roas_idx, "Significantly Better ROAS"
 
-    # Calculate percentage improvement
     improvement = (roas_of_roas_winner - roas_of_sales_winner) / roas_of_sales_winner
     
-    # If ROAS winner is > 30% better than the Sales winner, choose ROAS (Efficiency)
+    # 30% Logic
     if improvement > 0.30:
         return max_roas_idx, f"Better ROAS by {improvement:.0%}"
     else:
-        # Otherwise, stick with the higher volume (Sales)
         return max_sales_idx, "Higher Sales Vol (ROAS diff < 30%)"
+
+def normalize_match_type(val):
+    """Normalizes match types to generic categories"""
+    if pd.isna(val): return 'UNKNOWN'
+    val = str(val).upper()
+    if 'EXACT' in val: return 'EXACT'
+    if 'PHRASE' in val: return 'PHRASE'
+    if 'BROAD' in val: return 'BROAD'
+    return 'AUTO/OTHER'
 
 # -------------------------------
 
 # 1. File Upload
-uploaded_file = st.file_uploader("Upload Search Term Report", type=["csv", "xlsx"])
+uploaded_file = st.file_uploader("Upload Search Term Report (CSV or XLSX)", type=["csv", "xlsx"])
 
 if uploaded_file is not None:
     try:
-        # Determine file type and read accordingly
+        # Read File
         if uploaded_file.name.endswith('.csv'):
             df = pd.read_csv(uploaded_file)
         else:
-            # Requires 'openpyxl' library
             df = pd.read_excel(uploaded_file)
             
-        # Clean Column Names
         df.columns = df.columns.str.strip()
         
-        # Identify key columns dynamically
+        # 2. Column Mapping
         col_map = {
             'search_term': next((c for c in df.columns if 'Matched product' in c or 'Customer Search Term' in c), None),
             'campaign': next((c for c in df.columns if 'Campaign Name' in c), None),
             'ad_group': next((c for c in df.columns if 'Ad Group Name' in c), None),
+            'match_type': next((c for c in df.columns if 'Match Type' in c), None),
             'orders': next((c for c in df.columns if 'Orders' in c or 'Units' in c), None),
             'sales': next((c for c in df.columns if 'Sales' in c), None),
             'spend': next((c for c in df.columns if 'Spend' in c), None),
         }
 
-        # Check for missing columns
-        missing = [k for k, v in col_map.items() if v is None]
-        if missing:
-            st.error(f"Missing required columns: {missing}. Please check your file format.")
+        if any(v is None for v in col_map.values()):
+            st.error(f"Missing columns. Found: {col_map}. Please check your file.")
         else:
-            # Data Preparation
-            # Standardize numeric columns
+            # Data Type Cleanup
             for col in ['orders', 'sales', 'spend']:
                 df[col_map[col]] = pd.to_numeric(df[col_map[col]], errors='coerce').fillna(0)
-
-            # 2. AGGREGATION STEP
-            # Group by Search Term, Campaign, and Ad Group to combine daily rows
-            groupby_cols = [col_map['search_term'], col_map['campaign'], col_map['ad_group']]
             
-            df_aggregated = df.groupby(groupby_cols, as_index=False).agg({
+            # Normalize Match Type for logic
+            df['normalized_match'] = df[col_map['match_type']].apply(normalize_match_type)
+
+            # --- PRE-PROCESSING & AGGREGATION ---
+            # We aggregate by Term + Campaign + AdGroup + MatchType
+            groupby_cols = [col_map['search_term'], col_map['campaign'], col_map['ad_group'], 'normalized_match']
+            
+            df_agg = df.groupby(groupby_cols, as_index=False).agg({
                 col_map['orders']: 'sum',
                 col_map['sales']: 'sum',
                 col_map['spend']: 'sum'
             })
             
-            # Rename for easier access in the logic function
-            df_aggregated.rename(columns={
-                col_map['sales']: 'sales_val',
-                col_map['spend']: 'spend_val'
-            }, inplace=True)
+            df_agg.rename(columns={col_map['sales']: 'sales_val', col_map['spend']: 'spend_val'}, inplace=True)
+            df_agg['calculated_roas'] = df_agg.apply(lambda x: x['sales_val']/x['spend_val'] if x['spend_val'] > 0 else 0, axis=1)
 
-            # Calculate ROAS
-            df_aggregated['calculated_roas'] = df_aggregated.apply(
-                lambda x: x['sales_val'] / x['spend_val'] if x['spend_val'] > 0 else 0, axis=1
-            )
+            # ==========================================
+            # ANALYSIS 1: CANNIBALIZATION (Existing Logic)
+            # ==========================================
+            st.header("1. ⚔️ Keyword Cannibalization")
+            st.info("Search terms appearing in multiple ad groups. 'Negate' the inefficient ones.")
 
-            # Filter for Search Terms with at least one sale
-            sales_df = df_aggregated[df_aggregated[col_map['orders']] > 0].copy()
-            
-            # 3. Find Cannibalization
+            sales_df = df_agg[df_agg[col_map['orders']] > 0].copy()
             cannibal_counts = sales_df.groupby(col_map['search_term']).size()
             cannibal_terms = cannibal_counts[cannibal_counts > 1].index.tolist()
-            
+
             if not cannibal_terms:
-                st.success("No keyword cannibalization found! All converting search terms are unique.")
+                st.success("No cannibalization found.")
             else:
-                st.warning(f"Found {len(cannibal_terms)} search terms appearing in multiple campaigns/ad groups.")
-                
-                results = []
-                
-                # Analyze each term
+                c_results = []
                 for term in cannibal_terms:
-                    # Get all rows for this specific search term
                     term_data = sales_df[sales_df[col_map['search_term']] == term].copy()
-                    
-                    # APPLY DECISION LOGIC
                     winner_idx, reason = determine_winner(term_data)
                     
                     for idx, row in term_data.iterrows():
                         is_winner = (idx == winner_idx)
-                        recommendation = f"✅ KEEP ({reason})" if is_winner else "❌ NEGATE"
-                        
-                        results.append({
+                        rec = f"✅ KEEP ({reason})" if is_winner else "❌ NEGATE"
+                        c_results.append({
                             "Search Term": term,
-                            "Campaign Name": row[col_map['campaign']],
-                            "Ad Group Name": row[col_map['ad_group']],
-                            "Orders": row[col_map['orders']],
-                            "Sales": row['sales_val'],
+                            "Campaign": row[col_map['campaign']],
+                            "Ad Group": row[col_map['ad_group']],
+                            "Type": row['normalized_match'],
                             "Spend": row['spend_val'],
+                            "Orders": row[col_map['orders']],
                             "ROAS": round(row['calculated_roas'], 2),
-                            "Recommendation": recommendation
+                            "Action": rec
                         })
                 
-                # Create Final Report
-                final_report = pd.DataFrame(results)
+                c_df = pd.DataFrame(c_results).sort_values(by=['Search Term', 'Orders'], ascending=[True, False])
+                st.dataframe(c_df.style.apply(lambda x: ['background-color: #ffd2d2' if 'NEGATE' in v else '' for v in x], subset=['Action']), use_container_width=True)
                 
-                # Sort for readability: Put Negates next to their Keeps
-                final_report = final_report.sort_values(by=['Search Term', 'Sales'], ascending=[True, False])
+                # Download Cannibalization
+                st.download_button("Download Cannibalization Report", c_df.to_csv(index=False).encode('utf-8'), "cannibalization.csv")
 
+
+            st.markdown("---")
+
+
+            # ==========================================
+            # ANALYSIS 2: HARVESTING (New Logic)
+            # ==========================================
+            st.header("2. 🚀 Growth Opportunities (Harvesting)")
+            st.info("High-performing search terms (Orders ≥ 2) from Auto/Broad/Phrase that are **NOT** currently targeted as Exact.")
+
+            # 1. Identify Existing Exact Terms
+            # We look at the WHOLE report. If a term appears as 'EXACT' anywhere, we assume it's covered.
+            existing_exact_terms = set(df_agg[df_agg['normalized_match'] == 'EXACT'][col_map['search_term']].str.lower().unique())
+
+            # 2. Identify Candidates from Broad/Phrase/Auto
+            candidates = df_agg[
+                (df_agg['normalized_match'].isin(['BROAD', 'PHRASE', 'AUTO/OTHER'])) & 
+                (df_agg[col_map['orders']] >= 2)
+            ].copy()
+
+            # 3. Filter: Remove if it already exists in Exact list
+            harvest_opportunities = candidates[~candidates[col_map['search_term']].str.lower().isin(existing_exact_terms)]
+
+            if harvest_opportunities.empty:
+                st.write("No new harvesting opportunities found (all high-sales terms are already Exact targets).")
+            else:
+                h_results = []
+                for idx, row in harvest_opportunities.iterrows():
+                    h_results.append({
+                        "Search Term": row[col_map['search_term']],
+                        "Found In (Campaign)": row[col_map['campaign']],
+                        "Found In (Ad Group)": row[col_map['ad_group']],
+                        "Match Type": row['normalized_match'],
+                        "Orders": row[col_map['orders']],
+                        "Sales": row['sales_val'],
+                        "ROAS": round(row['calculated_roas'], 2),
+                        "Recommendation 1": "🎯 ADD to Manual Exact",
+                        "Recommendation 2": "⛔ NEGATE from Source"
+                    })
+                
+                h_df = pd.DataFrame(h_results).sort_values(by='Sales', ascending=False)
+                
                 # Metrics
-                st.divider()
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Converting Search Terms", len(sales_df[col_map['search_term']].unique()))
-                c2.metric("Cannibalized Terms", len(cannibal_terms))
-                negate_spend = final_report[final_report['Recommendation'].str.contains('NEGATE')]['Spend'].sum()
-                c3.metric("Redundant Spend (Negate)", f"₹ {negate_spend:,.2f}")
+                col1, col2 = st.columns(2)
+                col1.metric("New Keywords to Harvest", len(h_df))
+                col2.metric("Potential Sales Revenue", f"₹ {h_df['Sales'].sum():,.2f}")
 
-                # Display Main Table
-                st.subheader("Cannibalization Analysis (Sales vs ROAS)")
-                st.dataframe(
-                    final_report.style.apply(
-                        lambda x: ['background-color: #d4edda' if 'KEEP' in v else 'background-color: #f8d7da' for v in x], 
-                        subset=['Recommendation']
-                    ), 
-                    use_container_width=True
-                )
+                st.dataframe(h_df, use_container_width=True)
                 
-                # Download CSV
-                csv = final_report.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="Download Recommendations (CSV)",
-                    data=csv,
-                    file_name="cannibalization_recommendations.csv",
-                    mime="text/csv",
-                )
-
-                # Negation List
-                st.divider()
-                st.subheader("Action Plan: Negation List")
-                negate_only = final_report[final_report['Recommendation'].str.contains('NEGATE')]
-                st.write("Add these as **Negative Exact** in the specific campaigns below:")
-                st.table(negate_only[['Search Term', 'Campaign Name', 'Ad Group Name', 'Spend', 'ROAS']])
+                # Download Harvesting
+                st.download_button("Download Harvesting Plan", h_df.to_csv(index=False).encode('utf-8'), "harvesting_plan.csv")
+                
+                # Actionable List for Copy-Paste
+                with st.expander("View Quick Copy-Paste Lists"):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.subheader("Terms to ADD (Exact)")
+                        st.text_area("Copy these", "\n".join(h_df['Search Term'].unique()), height=300)
+                    with c2:
+                        st.subheader("Pairs to NEGATE (From Source)")
+                        st.write("Go to these Ad Groups and negate the specific term:")
+                        st.dataframe(h_df[['Found In (Campaign)', 'Found In (Ad Group)', 'Search Term']], hide_index=True)
 
     except Exception as e:
-        st.error(f"An error occurred: {e}")
-
-else:
-    st.info("Please upload a CSV or Excel file to begin.")
+        st.error(f"Error processing file: {e}")
